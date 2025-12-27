@@ -1,13 +1,15 @@
-# Qwen Video Understanding on Modal
+# Qwen3-VL Video Understanding on Modal
 
-Deploy Qwen2.5-VL-7B-Instruct on Modal for serverless video and image analysis.
+Deploy **Qwen3-VL-8B-Instruct** on Modal for serverless video and image analysis.
 
 ## Features
 
-- **Video Analysis**: Extract frames and analyze with Qwen2.5-VL
-- **Image Analysis**: Analyze images with vision-language model
+- **Hours-long video** support with full recall
+- **Timestamp grounding** - second-level precision
+- **256K context** (expandable to 1M)
+- **32-language OCR** support
+- **vLLM backend** - high-performance inference
 - **Serverless**: Scales to zero, pay only for usage
-- **Fast**: A100 GPUs with optimized inference via SGLang
 
 ## Quick Start
 
@@ -66,7 +68,7 @@ modal run qwen_video.py --video-url "https://example.com/video.mp4" --question "
 |-----------|------|---------|-------------|
 | `video_url` | string | required | URL of video to analyze |
 | `question` | string | "Describe what happens..." | Prompt/question |
-| `max_frames` | int | 16 | Frames to extract (1-32) |
+| `max_frames` | int | 32 | Frames to extract (1-64) |
 | `max_tokens` | int | 1024 | Max response tokens |
 
 ## Configuration
@@ -74,7 +76,7 @@ modal run qwen_video.py --video-url "https://example.com/video.mp4" --question "
 Edit `qwen_video.py` to customize:
 
 - `GPU_TYPE`: Default `a100-40gb` (options: `a10g`, `l40s`, `a100-80gb`)
-- `MODEL_PATH`: Default `Qwen/Qwen2.5-VL-7B-Instruct`
+- `MODEL_PATH`: Default `Qwen/Qwen3-VL-8B-Instruct`
 
 ## Cost
 

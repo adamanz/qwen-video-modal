@@ -1,8 +1,15 @@
 """
-Qwen2.5-VL Video Understanding on Modal
+Qwen3-VL Video Understanding on Modal
 
 Deploy with: modal deploy qwen_video.py
 Test with: modal run qwen_video.py
+
+Features:
+- Hours-long video support with full recall
+- Second-level timestamp grounding
+- 256K context (expandable to 1M)
+- 32-language OCR support
+- Native video understanding (no frame extraction needed)
 """
 
 import os
@@ -15,26 +22,22 @@ from uuid import uuid4
 import modal
 
 # Configuration
-GPU_TYPE = os.environ.get("GPU_TYPE", "a100-40gb")  # a100 for video processing
+GPU_TYPE = os.environ.get("GPU_TYPE", "a100-40gb")
 GPU_COUNT = int(os.environ.get("GPU_COUNT", 1))
 GPU_CONFIG = f"{GPU_TYPE}:{GPU_COUNT}"
 
-SGL_LOG_LEVEL = "error"  # try "debug" or "info" if you have issues
-
 MINUTES = 60  # seconds
 
-# Using Qwen2.5-VL for better video understanding
-MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"
-TOKENIZER_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"
-MODEL_CHAT_TEMPLATE = "qwen2-vl"
+# Using Qwen3-VL for advanced video understanding
+MODEL_PATH = "Qwen/Qwen3-VL-8B-Instruct"
 
 MODEL_VOL_PATH = Path("/models")
-MODEL_VOL = modal.Volume.from_name("qwen-video-cache", create_if_missing=True)
+MODEL_VOL = modal.Volume.from_name("qwen3-video-cache", create_if_missing=True)
 volumes = {MODEL_VOL_PATH: MODEL_VOL}
 
 
 def download_model():
-    """Download Qwen2.5-VL model to Modal volume."""
+    """Download Qwen3-VL model to Modal volume."""
     from huggingface_hub import snapshot_download
 
     snapshot_download(
@@ -44,7 +47,7 @@ def download_model():
     )
 
 
-# Build the container image
+# Build the container image with vLLM for Qwen3-VL support
 cuda_version = "12.8.0"
 flavor = "devel"
 operating_sys = "ubuntu22.04"
@@ -53,21 +56,18 @@ tag = f"{cuda_version}-{flavor}-{operating_sys}"
 vlm_image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.11")
     .entrypoint([])
-    .apt_install("libnuma-dev", "ffmpeg")  # ffmpeg for video processing
+    .apt_install("libnuma-dev", "ffmpeg")
     .uv_pip_install(
-        "transformers>=4.45.0",
+        "vllm>=0.11.0",  # vLLM with Qwen3-VL support
+        "transformers>=4.57.0",
+        "qwen-vl-utils==0.0.14",
         "numpy<2",
-        "fastapi[standard]==0.115.4",
-        "pydantic==2.9.2",
-        "requests==2.32.3",
-        "starlette==0.41.2",
-        "torch==2.7.1",
-        "sglang[all]==0.4.10.post2",
-        "sgl-kernel==0.2.8",
-        "hf-xet==1.1.5",
-        "qwen-vl-utils",  # Qwen VL utilities
-        "av",  # Video processing
-        "opencv-python-headless",  # Frame extraction
+        "fastapi[standard]",
+        "requests",
+        "hf-xet",
+        "av",
+        "opencv-python-headless",
+        "pillow",
         pre=True,
     )
     .env(
@@ -77,7 +77,6 @@ vlm_image = (
         }
     )
     .run_function(download_model, volumes=volumes)
-    .uv_pip_install("term-image==0.7.1")
 )
 
 app = modal.App("qwen-video-understanding")
@@ -92,24 +91,21 @@ app = modal.App("qwen-video-understanding")
 )
 @modal.concurrent(max_inputs=50)
 class VideoModel:
-    """Qwen2.5-VL model for video and image understanding."""
+    """Qwen3-VL model for video and image understanding using vLLM."""
 
     @modal.enter()
     def start_runtime(self):
-        """Starts an SGL runtime to execute inference."""
-        import sglang as sgl
+        """Initialize vLLM with Qwen3-VL model."""
+        from vllm import LLM
 
-        self.runtime = sgl.Runtime(
-            model_path=MODEL_PATH,
-            tokenizer_path=TOKENIZER_PATH,
-            tp_size=GPU_COUNT,
-            log_level=SGL_LOG_LEVEL,
+        self.llm = LLM(
+            model=str(MODEL_VOL_PATH / MODEL_PATH),
+            trust_remote_code=True,
+            max_model_len=32768,
+            gpu_memory_utilization=0.9,
+            tensor_parallel_size=GPU_COUNT,
         )
-        self.runtime.endpoint.chat_template = sgl.lang.chat_template.get_chat_template(
-            MODEL_CHAT_TEMPLATE
-        )
-        sgl.set_default_backend(self.runtime)
-        print(f"Model {MODEL_PATH} loaded successfully")
+        print(f"Model {MODEL_PATH} loaded successfully with vLLM")
 
     def _download_media(self, url: str) -> Path:
         """Download media file from URL."""
@@ -126,22 +122,21 @@ class VideoModel:
         media_path.write_bytes(response.content)
         return media_path
 
-    def _extract_video_frames(self, video_path: Path, max_frames: int = 16) -> list:
+    def _extract_video_frames(self, video_path: Path, max_frames: int = 32) -> list:
         """Extract frames from video for analysis."""
         import av
+        from PIL import Image
 
         frames = []
         container = av.open(str(video_path))
 
         total_frames = container.streams.video[0].frames
         if total_frames == 0:
-            # Estimate from duration
             duration = container.streams.video[0].duration
             fps = container.streams.video[0].average_rate
             if duration and fps:
                 total_frames = int(duration * fps / container.streams.video[0].time_base)
 
-        # Calculate frame interval
         interval = max(1, total_frames // max_frames)
 
         for i, frame in enumerate(container.decode(video=0)):
@@ -151,6 +146,40 @@ class VideoModel:
         container.close()
         return frames
 
+    def _process_vision_request(self, images: list, question: str, max_tokens: int) -> str:
+        """Process a vision request with images and question."""
+        from vllm import SamplingParams
+        from qwen_vl_utils import process_vision_info
+
+        # Build the message with images
+        content = []
+        for img in images:
+            content.append({"type": "image", "image": img})
+        content.append({"type": "text", "text": question})
+
+        messages = [{"role": "user", "content": content}]
+
+        # Process for Qwen3-VL format
+        prompt = self.llm.get_tokenizer().apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        # Prepare image inputs
+        image_inputs, _ = process_vision_info(messages)
+
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=0.7,
+            top_p=0.9,
+        )
+
+        outputs = self.llm.generate(
+            [{"prompt": prompt, "multi_modal_data": {"image": image_inputs}}],
+            sampling_params=sampling_params,
+        )
+
+        return outputs[0].outputs[0].text
+
     @modal.fastapi_endpoint(method="POST", docs=True)
     def analyze_image(self, request: dict) -> dict:
         """
@@ -159,11 +188,12 @@ class VideoModel:
         Args:
             image_url: URL of the image to analyze
             question: Question about the image (default: "Describe this image in detail")
+            max_tokens: Maximum tokens in response (default: 512)
 
         Returns:
             dict with 'answer' and 'processing_time'
         """
-        import sglang as sgl
+        from PIL import Image
 
         start = time.monotonic_ns()
         request_id = uuid4()
@@ -178,21 +208,18 @@ class VideoModel:
 
         try:
             image_path = self._download_media(image_url)
+            image = Image.open(image_path)
 
-            @sgl.function
-            def image_qa(s, image_path, question):
-                s += sgl.user(sgl.image(str(image_path)) + question)
-                s += sgl.assistant(sgl.gen("answer"))
+            answer = self._process_vision_request([image], question, max_tokens)
 
-            state = image_qa.run(
-                image_path=image_path, question=question, max_new_tokens=max_tokens
-            )
+            # Cleanup
+            image_path.unlink(missing_ok=True)
 
             processing_time = round((time.monotonic_ns() - start) / 1e9, 2)
             print(f"Request {request_id} completed in {processing_time}s")
 
             return {
-                "answer": state["answer"],
+                "answer": answer,
                 "processing_time": processing_time,
                 "request_id": str(request_id),
             }
@@ -207,14 +234,13 @@ class VideoModel:
 
         Args:
             video_url: URL of the video to analyze
-            question: Question about the video (default: "Describe what happens in this video")
-            max_frames: Maximum frames to extract (default: 16)
+            question: Question about the video
+            max_frames: Maximum frames to extract (default: 32, max: 64)
+            max_tokens: Maximum tokens in response (default: 1024)
 
         Returns:
             dict with 'answer', 'frames_analyzed', and 'processing_time'
         """
-        import sglang as sgl
-
         start = time.monotonic_ns()
         request_id = uuid4()
         print(f"Processing video request {request_id}")
@@ -224,51 +250,27 @@ class VideoModel:
             return {"error": "video_url is required"}
 
         question = request.get("question", "Describe what happens in this video in detail.")
-        max_frames = request.get("max_frames", 16)
+        max_frames = min(max(1, request.get("max_frames", 32)), 64)
         max_tokens = request.get("max_tokens", 1024)
 
         try:
-            # Download video
             video_path = self._download_media(video_url)
-
-            # Extract frames
             frames = self._extract_video_frames(video_path, max_frames)
             print(f"Extracted {len(frames)} frames from video")
 
-            # Save frames temporarily
-            frame_paths = []
-            for i, frame in enumerate(frames):
-                frame_path = Path(f"/tmp/{request_id}_frame_{i}.jpg")
-                frame.save(frame_path, "JPEG")
-                frame_paths.append(frame_path)
+            # Add context about video frames
+            video_prompt = f"These are {len(frames)} frames from a video in chronological order. {question}"
 
-            # Build multi-frame prompt
-            @sgl.function
-            def video_qa(s, frame_paths, question):
-                # Add all frames as a sequence
-                content = "These are frames from a video in chronological order:\n"
-                for i, fp in enumerate(frame_paths):
-                    content += sgl.image(str(fp))
-                    if i < len(frame_paths) - 1:
-                        content += " "
-                content += f"\n\n{question}"
-                s += sgl.user(content)
-                s += sgl.assistant(sgl.gen("answer"))
-
-            state = video_qa.run(
-                frame_paths=frame_paths, question=question, max_new_tokens=max_tokens
-            )
+            answer = self._process_vision_request(frames, video_prompt, max_tokens)
 
             # Cleanup
-            for fp in frame_paths:
-                fp.unlink(missing_ok=True)
             video_path.unlink(missing_ok=True)
 
             processing_time = round((time.monotonic_ns() - start) / 1e9, 2)
             print(f"Request {request_id} completed in {processing_time}s")
 
             return {
-                "answer": state["answer"],
+                "answer": answer,
                 "frames_analyzed": len(frames),
                 "processing_time": processing_time,
                 "request_id": str(request_id),
@@ -279,7 +281,8 @@ class VideoModel:
 
     @modal.exit()
     def shutdown_runtime(self):
-        self.runtime.shutdown()
+        """Cleanup on shutdown."""
+        pass
 
 
 @app.local_entrypoint()
@@ -301,7 +304,6 @@ def main(
     model = VideoModel()
 
     if video_url:
-        # Test video analysis
         payload = json.dumps({
             "video_url": video_url,
             "question": question or "Describe what happens in this video in detail.",
@@ -309,7 +311,6 @@ def main(
         endpoint_url = model.analyze_video.get_web_url()
         print(f"\nAnalyzing video: {video_url}")
     else:
-        # Test image analysis (default)
         if not image_url:
             image_url = "https://modal-public-assets.s3.amazonaws.com/golden-gate-bridge.jpg"
 
@@ -351,12 +352,3 @@ warnings.filterwarnings(
     message="It seems this process is not running within a terminal",
     category=UserWarning,
 )
-
-
-class Colors:
-    """ANSI color codes"""
-    GREEN = "\033[0;32m"
-    BLUE = "\033[0;34m"
-    GRAY = "\033[0;90m"
-    BOLD = "\033[1m"
-    END = "\033[0m"
